@@ -17,44 +17,46 @@ st.set_page_config(
 
 @st.cache_data
 def get_stock_data(tickers, start_date, end_date):
-    """Fetches historical stock data from Yahoo Finance in a robust way."""
-    try:
-        # Download the full dataset first
-        raw_data = yf.download(tickers, start=start_date, end=end_date)
+    """Fetches historical stock data from Yahoo Finance robustly by downloading one by one."""
+    all_data = []
+    failed_tickers = []
+    
+    # Use a single session to speed up requests for multiple tickers
+    session = yf.Ticker("MSFT")._session
+    
+    for ticker in tickers:
+        try:
+            df = yf.download(ticker, start=start_date, end=end_date, session=session, progress=False, ignore_tz=True)
+            if df.empty or 'Adj Close' not in df.columns:
+                failed_tickers.append(ticker)
+                continue
+            
+            # Append the 'Adj Close' column, renamed to the ticker symbol
+            all_data.append(df[['Adj Close']].rename(columns={'Adj Close': ticker}))
+        except Exception:
+            failed_tickers.append(ticker)
 
-        # Check if the download returned any data
-        if raw_data.empty:
-            return None, "No data fetched. Check ticker symbols, date range, or your internet connection."
+    if not all_data:
+        return None, "Could not fetch valid data for any of the provided tickers. Please check the symbols."
 
-        # Select the 'Adj Close' column. Handle both single and multiple ticker cases.
-        if len(tickers) == 1:
-            # If only one ticker, 'Adj Close' is a direct column
-            # We wrap it in double brackets to ensure it remains a DataFrame
-            data = raw_data[['Adj Close']]
-            # Rename the column to the ticker symbol for consistency
-            data.columns = tickers
-        else:
-            # If multiple tickers, 'Adj Close' is a top-level column in a multi-index
-            data = raw_data['Adj Close']
+    # Concatenate all successful dataframes
+    data = pd.concat(all_data, axis=1)
+    
+    # Forward-fill missing values, then back-fill to handle gaps
+    data = data.ffill().bfill()
 
-        # Check again if the resulting 'Adj Close' data is empty
-        if data.empty:
-            return None, "Could not retrieve 'Adj Close' data for the given tickers."
+    # Drop any columns that are still all NaN
+    data = data.dropna(axis=1, how='all')
 
-        # Forward-fill missing values, then back-fill to handle gaps
-        data = data.ffill().bfill()
+    if data.empty:
+        return None, "All selected tickers failed to return valid data after cleaning."
+    
+    # Form a warning message about failed tickers, if any
+    warning_message = None
+    if failed_tickers:
+        warning_message = f"Warning: Could not fetch data for the following tickers: {', '.join(failed_tickers)}. They have been excluded from the simulation."
 
-        # Drop any columns that are still all NaN (for tickers that failed completely)
-        data = data.dropna(axis=1, how='all')
-
-        if data.empty:
-            return None, "All selected tickers failed to return valid data after cleaning."
-
-        return data, None
-    except Exception as e:
-        if "No data found for any tickers" in str(e):
-            return None, "Invalid ticker symbol(s) provided. Please check your inputs."
-        return None, f"An error occurred: {e}"
+    return data, warning_message
 
 
 def run_monte_carlo_simulation(daily_returns, weights, num_simulations, num_days):
@@ -179,94 +181,102 @@ if st.button("Run Simulation", type="primary"):
             end_date = datetime.now()
             start_date = end_date - timedelta(days=5*365) # 5 years of historical data
             
-            stock_data, error = get_stock_data(tickers, start_date, end_date)
+            stock_data, message = get_stock_data(tickers, start_date, end_date)
 
-            if error:
-                st.error(error)
+            # Display any non-critical warnings about failed tickers
+            if message:
+                st.warning(message)
+
+            # Halt only if no data was returned at all
+            if stock_data is None:
+                st.error("Simulation aborted as no valid stock data could be fetched.")
             else:
                 daily_returns = stock_data.pct_change().dropna()
-                
-                # Ensure the weights and columns align after potential ticker drops
-                valid_tickers = daily_returns.columns.tolist()
-                valid_weights = [weights[tickers.index(t)] for t in valid_tickers]
-                # Renormalize weights in case some tickers were dropped
-                total_valid_weight = sum(valid_weights)
-                renormalized_weights = [w / total_valid_weight for w in valid_weights]
 
-
-                # --- Apply Stress Test if selected ---
-                if apply_stress and scenario:
-                    st.info(f"Applying stress test: '{scenario}' with a {shock_value*100:.2f}% shock.")
-                    daily_returns_stressed = apply_stress_scenario(daily_returns, scenario, shock_value)
+                if daily_returns.empty or daily_returns.shape[1] == 0:
+                    st.error("Could not calculate daily returns. The historical data for valid tickers might be too sparse or incomplete.")
                 else:
-                    daily_returns_stressed = daily_returns
+                    # Ensure the weights and columns align after potential ticker drops
+                    valid_tickers = daily_returns.columns.tolist()
+                    valid_weights = [weights[tickers.index(t)] for t in valid_tickers]
+                    
+                    # Renormalize weights to sum to 1.0 in case some tickers were dropped
+                    total_valid_weight = sum(valid_weights)
+                    renormalized_weights = [w / total_valid_weight for w in valid_weights]
 
-                # --- Run Monte Carlo Simulation ---
-                simulations = run_monte_carlo_simulation(daily_returns_stressed, renormalized_weights, num_simulations, num_days)
 
-                # --- Process and Visualize Results ---
-                # Assume initial investment of $100,000
-                initial_investment = 100000
-                cumulative_returns = (1 + simulations).cumprod(axis=1)
-                simulated_portfolio_values = initial_investment * cumulative_returns
+                    # --- Apply Stress Test if selected ---
+                    if apply_stress and scenario:
+                        st.info(f"Applying stress test: '{scenario}' with a {shock_value*100:.2f}% shock.")
+                        daily_returns_stressed = apply_stress_scenario(daily_returns, scenario, shock_value)
+                    else:
+                        daily_returns_stressed = daily_returns
 
-                # --- Display Metrics ---
-                final_values = simulated_portfolio_values[:, -1]
-                median_final_value = np.median(final_values)
-                ci_5 = np.percentile(final_values, 5)
-                ci_95 = np.percentile(final_values, 95)
-                
-                st.header("Simulation Results")
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Median Final Value", f"${median_final_value:,.2f}")
-                col2.metric("5th Percentile (Worst Case)", f"${ci_5:,.2f}")
-                col3.metric("95th Percentile (Best Case)", f"${ci_95:,.2f}")
+                    # --- Run Monte Carlo Simulation ---
+                    simulations = run_monte_carlo_simulation(daily_returns_stressed, renormalized_weights, num_simulations, num_days)
 
-                # --- Plotly Chart ---
-                fig = go.Figure()
-                
-                # Plot a subset of simulations for performance
-                num_to_plot = min(num_simulations, 100)
-                for i in range(num_to_plot):
-                    fig.add_trace(go.Scatter(
-                        y=simulated_portfolio_values[i, :],
-                        mode='lines',
-                        line=dict(width=1, color='rgba(173, 216, 230, 0.5)'), # Light blue with transparency
-                        hoverinfo='none',
-                        showlegend=False
-                    ))
-                
-                # Plot median, 5th, and 95th percentiles
-                median_path = np.median(simulated_portfolio_values, axis=0)
-                ci_5_path = np.percentile(simulated_portfolio_values, 5, axis=0)
-                ci_95_path = np.percentile(simulated_portfolio_values, 95, axis=0)
-                
-                fig.add_trace(go.Scatter(y=ci_5_path, mode='lines', line=dict(color='red', dash='dash'), name='5th Percentile'))
-                fig.add_trace(go.Scatter(y=median_path, mode='lines', line=dict(color='black', width=3), name='Median Outcome'))
-                fig.add_trace(go.Scatter(y=ci_95_path, mode='lines', line=dict(color='green', dash='dash'), name='95th Percentile'))
+                    # --- Process and Visualize Results ---
+                    # Assume initial investment of $100,000
+                    initial_investment = 100000
+                    cumulative_returns = (1 + simulations).cumprod(axis=1)
+                    simulated_portfolio_values = initial_investment * cumulative_returns
 
-                fig.update_layout(
-                    title=f'Portfolio Value Projections over {projection_years} Years',
-                    xaxis_title='Trading Days',
-                    yaxis_title='Portfolio Value ($)',
-                    showlegend=True,
-                    legend=dict(x=0, y=1, traceorder="normal"),
-                    template='plotly_white'
-                )
+                    # --- Display Metrics ---
+                    final_values = simulated_portfolio_values[:, -1]
+                    median_final_value = np.median(final_values)
+                    ci_5 = np.percentile(final_values, 5)
+                    ci_95 = np.percentile(final_values, 95)
+                    
+                    st.header("Simulation Results")
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Median Final Value", f"${median_final_value:,.2f}")
+                    col2.metric("5th Percentile (Worst Case)", f"${ci_5:,.2f}")
+                    col3.metric("95th Percentile (Best Case)", f"${ci_95:,.2f}")
 
-                st.plotly_chart(fig, use_container_width=True)
+                    # --- Plotly Chart ---
+                    fig = go.Figure()
+                    
+                    # Plot a subset of simulations for performance
+                    num_to_plot = min(num_simulations, 100)
+                    for i in range(num_to_plot):
+                        fig.add_trace(go.Scatter(
+                            y=simulated_portfolio_values[i, :],
+                            mode='lines',
+                            line=dict(width=1, color='rgba(173, 216, 230, 0.5)'), # Light blue with transparency
+                            hoverinfo='none',
+                            showlegend=False
+                        ))
+                    
+                    # Plot median, 5th, and 95th percentiles
+                    median_path = np.median(simulated_portfolio_values, axis=0)
+                    ci_5_path = np.percentile(simulated_portfolio_values, 5, axis=0)
+                    ci_95_path = np.percentile(simulated_portfolio_values, 95, axis=0)
+                    
+                    fig.add_trace(go.Scatter(y=ci_5_path, mode='lines', line=dict(color='red', dash='dash'), name='5th Percentile'))
+                    fig.add_trace(go.Scatter(y=median_path, mode='lines', line=dict(color='black', width=3), name='Median Outcome'))
+                    fig.add_trace(go.Scatter(y=ci_95_path, mode='lines', line=dict(color='green', dash='dash'), name='95th Percentile'))
 
-                st.header("Distribution of Final Portfolio Values")
-                hist_fig = go.Figure(data=[go.Histogram(x=final_values, nbinsx=100, name='Distribution')])
-                hist_fig.add_vline(x=median_final_value, line_dash="dash", line_color="black", annotation_text="Median")
-                hist_fig.add_vline(x=ci_5, line_dash="dash", line_color="red", annotation_text="5th Percentile")
-                hist_fig.add_vline(x=ci_95, line_dash="dash", line_color="green", annotation_text="95th Percentile")
-                hist_fig.update_layout(
-                    title='Frequency Distribution of Final Outcomes',
-                    xaxis_title='Final Portfolio Value ($)',
-                    yaxis_title='Frequency',
-                    template='plotly_white'
-                )
-                st.plotly_chart(hist_fig, use_container_width=True)
+                    fig.update_layout(
+                        title=f'Portfolio Value Projections over {projection_years} Years',
+                        xaxis_title='Trading Days',
+                        yaxis_title='Portfolio Value ($)',
+                        showlegend=True,
+                        legend=dict(x=0, y=1, traceorder="normal"),
+                        template='plotly_white'
+                    )
 
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.header("Distribution of Final Portfolio Values")
+                    hist_fig = go.Figure(data=[go.Histogram(x=final_values, nbinsx=100, name='Distribution')])
+                    hist_fig.add_vline(x=median_final_value, line_dash="dash", line_color="black", annotation_text="Median")
+                    hist_fig.add_vline(x=ci_5, line_dash="dash", line_color="red", annotation_text="5th Percentile")
+                    hist_fig.add_vline(x=ci_95, line_dash="dash", line_color="green", annotation_text="95th Percentile")
+                    hist_fig.update_layout(
+                        title='Frequency Distribution of Final Outcomes',
+                        xaxis_title='Final Portfolio Value ($)',
+                        yaxis_title='Frequency',
+                        template='plotly_white'
+                    )
+                    st.plotly_chart(hist_fig, use_container_width=True)
 
