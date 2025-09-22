@@ -17,16 +17,45 @@ st.set_page_config(
 
 @st.cache_data
 def get_stock_data(tickers, start_date, end_date):
-    """Fetches historical stock data from Yahoo Finance."""
+    """Fetches historical stock data from Yahoo Finance in a robust way."""
     try:
-        data = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
+        # Download the full dataset first
+        raw_data = yf.download(tickers, start=start_date, end=date=end_date)
+
+        # Check if the download returned any data
+        if raw_data.empty:
+            return None, "No data fetched. Check ticker symbols, date range, or your internet connection."
+
+        # Select the 'Adj Close' column. Handle both single and multiple ticker cases.
+        if len(tickers) == 1:
+            # If only one ticker, 'Adj Close' is a direct column
+            # We wrap it in double brackets to ensure it remains a DataFrame
+            data = raw_data[['Adj Close']]
+            # Rename the column to the ticker symbol for consistency
+            data.columns = tickers
+        else:
+            # If multiple tickers, 'Adj Close' is a top-level column in a multi-index
+            data = raw_data['Adj Close']
+
+        # Check again if the resulting 'Adj Close' data is empty
         if data.empty:
-            return None, "No data fetched. Check ticker symbols and date range."
-        # Forward-fill missing values, then back-fill
+            return None, "Could not retrieve 'Adj Close' data for the given tickers."
+
+        # Forward-fill missing values, then back-fill to handle gaps
         data = data.ffill().bfill()
+
+        # Drop any columns that are still all NaN (for tickers that failed completely)
+        data = data.dropna(axis=1, how='all')
+
+        if data.empty:
+            return None, "All selected tickers failed to return valid data after cleaning."
+
         return data, None
     except Exception as e:
+        if "No data found for any tickers" in str(e):
+            return None, "Invalid ticker symbol(s) provided. Please check your inputs."
         return None, f"An error occurred: {e}"
+
 
 def run_monte_carlo_simulation(daily_returns, weights, num_simulations, num_days):
     """Runs a Monte Carlo simulation for portfolio projections."""
@@ -156,6 +185,14 @@ if st.button("Run Simulation", type="primary"):
                 st.error(error)
             else:
                 daily_returns = stock_data.pct_change().dropna()
+                
+                # Ensure the weights and columns align after potential ticker drops
+                valid_tickers = daily_returns.columns.tolist()
+                valid_weights = [weights[tickers.index(t)] for t in valid_tickers]
+                # Renormalize weights in case some tickers were dropped
+                total_valid_weight = sum(valid_weights)
+                renormalized_weights = [w / total_valid_weight for w in valid_weights]
+
 
                 # --- Apply Stress Test if selected ---
                 if apply_stress and scenario:
@@ -165,7 +202,7 @@ if st.button("Run Simulation", type="primary"):
                     daily_returns_stressed = daily_returns
 
                 # --- Run Monte Carlo Simulation ---
-                simulations = run_monte_carlo_simulation(daily_returns_stressed, weights, num_simulations, num_days)
+                simulations = run_monte_carlo_simulation(daily_returns_stressed, renormalized_weights, num_simulations, num_days)
 
                 # --- Process and Visualize Results ---
                 # Assume initial investment of $100,000
@@ -231,3 +268,4 @@ if st.button("Run Simulation", type="primary"):
                     template='plotly_white'
                 )
                 st.plotly_chart(hist_fig, use_container_width=True)
+
