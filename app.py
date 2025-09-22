@@ -20,7 +20,7 @@ def get_stock_data(tickers, start_date, end_date):
     """Fetches historical stock data from Yahoo Finance in a robust way."""
     try:
         # Download the full dataset first
-        raw_data = yf.download(tickers, start=start_date, end=date=end_date)
+        raw_data = yf.download(tickers, start=start_date, end=end_date)
 
         # Check if the download returned any data
         if raw_data.empty:
@@ -268,4 +268,5 @@ if st.button("Run Simulation", type="primary"):
                     template='plotly_white'
                 )
                 st.plotly_chart(hist_fig, use_container_width=True)
+
 
